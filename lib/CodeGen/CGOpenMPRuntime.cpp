@@ -7131,6 +7131,7 @@ CGOpenMPRuntime::generateMapArrays(CodeGenFunction &CGF,
                                          CurPointers, CurSizes, CurMapTypes,
                                          CurLambdas);
 
+      // Map the pointers inside the lambda if the correct flag is enabled.
       if (CGF.getLangOpts().OpenMPImplicitMapLambdas) {
         if (const auto *RD = (*RI)->getType()->getPointeeCXXRecordDecl()) {
           if (RD->isLambda())
