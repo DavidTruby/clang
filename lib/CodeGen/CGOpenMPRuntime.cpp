@@ -7112,6 +7112,13 @@ CGOpenMPRuntime::generateMapArrays(CodeGenFunction &CGF,
         MEHandler.generateDefaultMapInfo(*CI, **RI, *CV, CurBasePointers,
                                          CurPointers, CurSizes, CurMapTypes,
                                          CurLambdas);
+
+      if (CGF.getLangOpts().OpenMPImplicitMapLambdas) {
+        if (const auto *RD = (*RI)->getType()->getPointeeCXXRecordDecl()) {
+          if (RD->isLambda())
+            CurLambdas.back() = RD;
+        }
+      }
     }
     // We expect to have at least an element of information for this capture.
     assert(!CurBasePointers.empty() && "Non-existing map pointer for capture!");
@@ -8477,12 +8484,6 @@ void MappableExprsHandler::generateDefaultMapInfo(
     CurMapTypes.back() =
         adjustMapModifiersForPrivateClauses(CI, CurMapTypes.back());
 
-    if (CGF.getLangOpts().OpenMPImplicitMapLambdas) {
-      if (const auto *RD = RI.getType()->getPointeeCXXRecordDecl()) {
-        if (RD->isLambda())
-          CurLambdas.back() = RD;
-      }
-    }
   }
   // Every default map produces a single argument, so, it is always the
   // first one.
