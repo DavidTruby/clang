@@ -7270,6 +7270,41 @@ void OffloadBundler::ConstructJob(Compilation &C, const JobAction &JA,
 
   ArgStringList CmdArgs;
 
+  // If the flags -c -o are used, replace offload bundler call with call
+  // to linux linker. If linker is not found then call the offload
+  // bundler as normal.
+  StringRef LinkerName = getToolChain().GetLinkerPath();
+  bool IsLDLinker = LinkerName.endswith("ld");
+  // printf(" LD path = %s\n\n", TCArgs.MakeArgString(LinkerName));
+  // printf(" -c = %d\n", TCArgs.hasArg(options::OPT_c));
+  // printf(" -o = %d\n", TCArgs.hasArg(options::OPT_o));
+  if (TCArgs.hasArg(options::OPT_c) && TCArgs.hasArg(options::OPT_o) && IsLDLinker) {
+    // Make linking partial.
+    CmdArgs.push_back(TCArgs.MakeArgString("-r"));
+
+    // Add input files.
+    for (unsigned I = 0; I < Inputs.size(); ++I) {
+      CmdArgs.push_back(TCArgs.MakeArgString(Inputs[I].getFilename()));
+    }
+
+    // Add output file.
+    CmdArgs.push_back(TCArgs.MakeArgString("-o"));
+    CmdArgs.push_back(TCArgs.MakeArgString(Output.getFilename()));
+
+    // Add command.
+    C.addCommand(llvm::make_unique<Command>(
+        JA, *this, TCArgs.MakeArgString(getToolChain().GetLinkerPath()),
+        CmdArgs, None));
+
+    // printf("\nLD ");
+    // for(auto arg: CmdArgs) {
+    //   printf("%s ", arg);
+    // }
+    // printf("\n\n");
+
+    return;
+  }
+
   // Get the type.
   CmdArgs.push_back(TCArgs.MakeArgString(
       Twine("-type=") + types::getTypeTempSuffix(Output.getType())));
@@ -7323,6 +7358,12 @@ void OffloadBundler::ConstructJob(Compilation &C, const JobAction &JA,
   }
   CmdArgs.push_back(TCArgs.MakeArgString(UB));
 
+  // printf("\nCLANG-OFFLOAD-BUNDLER 1 ");
+  // for(auto arg: CmdArgs) {
+  //   printf("%s ", arg);
+  // }
+  // printf("\n\n");
+
   // All the inputs are encoded as commands.
   C.addCommand(llvm::make_unique<Command>(
       JA, *this,
@@ -7352,12 +7393,12 @@ void OffloadBundler::ConstructJobMultipleOutputs(
   // Get the type.
   StringRef InputFilname = Input.getFilename();
   bool InputIsArchive = InputFilname.endswith(".a");
-  if (InputIsArchive)
-    CmdArgs.push_back(TCArgs.MakeArgString(
-        Twine("-type=a")));
-  else
+  if (InputIsArchive) {
+    return;
+  } else {
     CmdArgs.push_back(TCArgs.MakeArgString(
         Twine("-type=") + types::getTypeTempSuffix(Input.getType())));
+  }
 
   // Get the arch
   StringRef Arch = TCArgs.getLastArgValue(options::OPT_march_EQ);
@@ -7398,6 +7439,12 @@ void OffloadBundler::ConstructJobMultipleOutputs(
   }
   CmdArgs.push_back(TCArgs.MakeArgString(UB));
   CmdArgs.push_back("-unbundle");
+
+  // printf("\nCLANG-OFFLOAD-BUNDLER 2 ");
+  // for(auto arg: CmdArgs) {
+  //   printf("%s ", arg);
+  // }
+  // printf("\n\n");
 
   // All the inputs are encoded as commands.
   C.addCommand(llvm::make_unique<Command>(
@@ -12290,7 +12337,24 @@ void NVPTX::Assembler::ConstructJob(Compilation &C, const JobAction &JA,
   CmdArgs.push_back("--gpu-name");
   CmdArgs.push_back(Args.MakeArgString(CudaArchToString(gpu_arch)));
   CmdArgs.push_back("--output-file");
-  CmdArgs.push_back(Args.MakeArgString(Output.getFilename()));
+  SmallString<256> CubinName;
+  const char *CubinF;
+  if (JA.isOffloading(Action::OFK_OpenMP) &&
+      Args.hasArg(options::OPT_c) &&
+      Args.hasArg(options::OPT_o)) {
+    CubinName = llvm::sys::path::filename(Output.getFilename());
+    if (C.getDriver().isSaveTempsEnabled()) {
+      llvm::sys::path::replace_extension(CubinName, "cubin");
+      CubinF = C.getArgs().MakeArgString(CubinName.c_str());
+    } else {
+      llvm::sys::path::replace_extension(CubinName, "");
+      CubinName = C.getDriver().GetTemporaryPath(CubinName, "cubin");
+      CubinF = C.addTempFile(C.getArgs().MakeArgString(CubinName.c_str()));
+    }
+    CmdArgs.push_back(Args.MakeArgString(CubinF));
+  } else {
+    CmdArgs.push_back(Args.MakeArgString(Output.getFilename()));
+  }
   for (const auto& II : Inputs)
     CmdArgs.push_back(Args.MakeArgString(II.getFilename()));
 
@@ -12316,7 +12380,140 @@ void NVPTX::Assembler::ConstructJob(Compilation &C, const JobAction &JA,
     Exec = A->getValue();
   else
     Exec = Args.MakeArgString(TC.GetProgramPath("ptxas"));
+  // printf("\nPTXAS ");
+  //   for(auto arg: CmdArgs) {
+  //     printf("%s ", arg);
+  //   }
+  // printf("\n\n");
   C.addCommand(llvm::make_unique<Command>(JA, *this, Exec, CmdArgs, Inputs));
+
+  std::pair<StringRef, StringRef> Split;
+
+  if (JA.isDeviceOffloading(Action::OFK_OpenMP) &&
+      Args.hasArg(options::OPT_c) &&
+      Args.hasArg(options::OPT_o)) {
+    ArgStringList FatbinaryCmdArgs;
+    FatbinaryCmdArgs.push_back(TC.getTriple().isArch64Bit() ? "-64" : "-32");
+
+    ArgStringList CompilerCmdArgs;
+    CompilerCmdArgs.push_back(Args.MakeArgString("-c"));
+    CompilerCmdArgs.push_back(Args.MakeArgString("-o"));
+    CompilerCmdArgs.push_back(Args.MakeArgString(Output.getFilename()));
+    CompilerCmdArgs.push_back(Args.MakeArgString(llvm::Twine("-I") +
+        TC.CudaInstallation.getBinPath() + llvm::Twine("/../include")));
+
+    // Create fatbin file using fatbinary executable.
+    SmallString<128> OrigOutputFileName =
+        llvm::sys::path::filename(Output.getFilename());
+
+    // Create fatbin file.
+    const char *FatbinF;
+    if (C.getDriver().isSaveTempsEnabled()) {
+      llvm::sys::path::replace_extension(OrigOutputFileName, "fatbin");
+      FatbinF = C.getArgs().MakeArgString(OrigOutputFileName.c_str());
+    } else {
+      llvm::sys::path::replace_extension(OrigOutputFileName, "");
+      OrigOutputFileName = C.getDriver().GetTemporaryPath(OrigOutputFileName, "fatbin");
+      FatbinF = C.addTempFile(C.getArgs().MakeArgString(OrigOutputFileName.c_str()));
+    }
+    FatbinaryCmdArgs.push_back(Args.MakeArgString(llvm::Twine("--create=") + FatbinF));
+
+    // Create fatbin file wrapper using fatbinary executable.
+    const char *WrappedFatbinF;
+    llvm::sys::path::replace_extension(OrigOutputFileName, "fatbin.c");
+    if (C.getDriver().isSaveTempsEnabled())
+      WrappedFatbinF = C.getArgs().MakeArgString(OrigOutputFileName.c_str());
+    else
+      WrappedFatbinF =
+          C.addTempFile(C.getArgs().MakeArgString(OrigOutputFileName.c_str()));
+    FatbinaryCmdArgs.push_back(Args.MakeArgString(llvm::Twine("--embedded-fatbin=") +
+                                                  WrappedFatbinF));
+    // Create filename without extension.
+    StringRef OrigOutputFileNameRoot = OrigOutputFileName;
+    Split = OrigOutputFileNameRoot.rsplit('.');
+    Split = Split.first.rsplit('.');
+
+    // Continue assembling the host compiler arguments.
+    CompilerCmdArgs.push_back(Args.MakeArgString(WrappedFatbinF));
+
+    // TODO: Enable this is required for XL compatibility.
+    // CompilerCmdArgs.push_back(Args.MakeArgString(ReWrappedFatbinF));
+
+    StringRef GPUArch = Args.getLastArgValue(options::OPT_march_EQ);
+    assert(!GPUArch.empty() && "At least one GPU Arch required for nvlink.");
+
+    for (const auto& II : Inputs) {
+      SmallString<128> OrigInputFileName =
+          llvm::sys::path::filename(II.getFilename());
+
+      if (II.getType() == types::TY_LLVM_IR ||
+          II.getType() == types::TY_LTO_IR ||
+          II.getType() == types::TY_LTO_BC ||
+          II.getType() == types::TY_LLVM_BC) {
+        C.getDriver().Diag(diag::err_drv_no_linker_llvm_support)
+            << getToolChain().getTripleString();
+        continue;
+      }
+
+      // Currently, we only pass the input files to the linker, we do not pass
+      // any libraries that may be valid only for the host. Any static libs will
+      // be handled at the link stage.
+      if (!II.isFilename() || OrigInputFileName.endswith(".a"))
+        continue;
+
+      auto *A = II.getAction();
+      assert(A->getInputs().size() == 1 &&
+             "Device offload action is expected to have a single input");
+      CudaArch gpu_arch = StringToCudaArch(GPUArch);
+
+      // We need to pass an Arch of the form "sm_XX" for cubin files and
+      // "compute_XX" for ptx.
+      const char *Arch =
+          (II.getType() == types::TY_PP_Asm)
+              ? CudaVirtualArchToString(VirtualArchForCudaArch(gpu_arch))
+              : GPUArch.str().c_str();
+      const char *PtxF =
+          C.addTempFile(C.getArgs().MakeArgString(II.getFilename()));
+      FatbinaryCmdArgs.push_back("--cmdline=--compile-only");
+      FatbinaryCmdArgs.push_back(Args.MakeArgString(llvm::Twine("--image=profile=") +
+                                           Arch + ",file=" + PtxF));
+      FatbinaryCmdArgs.push_back(Args.MakeArgString(llvm::Twine("--image=profile=") +
+          GPUArch.str().c_str() + "@" + Arch + ",file=" + CubinF));
+    }
+
+    FatbinaryCmdArgs.push_back(Args.MakeArgString("--cuda"));
+    FatbinaryCmdArgs.push_back(Args.MakeArgString("--device-c"));
+
+    for (const auto& A : Args.getAllArgValues(options::OPT_Xcuda_fatbinary))
+      FatbinaryCmdArgs.push_back(Args.MakeArgString(A));
+
+    // fatbinary --create=ompprint.fatbin -64
+    //     --image=profile=compute_35,file=ompprint.compute_35.ptx
+    //     --image=profile=sm_35@compute_35,file=ompprint.compute_35.sm_35.cubin
+    //     --embedded-fatbin=ompprint.fatbin.c --cuda --device-c
+    const char *Exec = Args.MakeArgString(TC.GetProgramPath("fatbinary"));
+    // printf("\nFATBINARY ");
+    // for(auto arg: FatbinaryCmdArgs) {
+    //   printf("%s ", arg);
+    // }
+    // printf("\n\n");
+    C.addCommand(llvm::make_unique<Command>(JA, *this, Exec, FatbinaryCmdArgs, Inputs));
+
+    // clang++ -g -c ompprint.fatbinwrap.c -I/usr/local/cuda-9.0/include
+    //     -o ompprint.fatbin.o
+    if (!Split.first.rsplit('/').second.empty())
+      CompilerCmdArgs.push_back(Args.MakeArgString(llvm::Twine("-D__NV_MODULE_ID=") + Split.first.rsplit('/').second.split('-').first));
+    else
+      CompilerCmdArgs.push_back(Args.MakeArgString(llvm::Twine("-D__NV_MODULE_ID=") + Split.first.split('-').first));
+    const char *CompilerExec = Args.MakeArgString(TC.GetProgramPath("g++"));
+    // printf("\nG++ ");
+    // for(auto arg: CompilerCmdArgs) {
+    //   printf("%s ", arg);
+    // }
+    // printf("\n\n");
+    C.addCommand(llvm::make_unique<Command>(
+        JA, *this, CompilerExec, CompilerCmdArgs, Inputs));
+  }
 }
 
 // All inputs to this linker must be from CudaDeviceActions, as we need to look
@@ -12338,6 +12535,10 @@ void NVPTX::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   assert(!JA.isHostOffloading(Action::OFK_OpenMP) &&
          "CUDA toolchain not expected for an OpenMP host device.");
   if (JA.isDeviceOffloading(Action::OFK_OpenMP)) {
+    CmdArgs.push_back("-dlink");
+    CmdArgs.push_back("-cubin");
+    // CmdArgs.push_back("-ccbin clang++");
+
     if (Output.isFilename()) {
       CmdArgs.push_back("-o");
       CmdArgs.push_back(Output.getFilename());
@@ -12359,6 +12560,8 @@ void NVPTX::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
     // add paths specified in LIBRARY_PATH environment variable as -L options.
     addDirectoryList(Args, CmdArgs, "-L", "LIBRARY_PATH");
+
+    Args.AddAllArgs(CmdArgs, options::OPT_L);
 
     // add paths for the default clang library path.
     SmallString<256> DefaultLibPath =
@@ -12390,8 +12593,13 @@ void NVPTX::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
       // Currently, we only pass the input files to the linker, we do not pass
       // any libraries that may be valid only for the host.
-      if (!II.isFilename())
+      if (!II.isFilename()) {
+        CmdArgs.push_back(C.getArgs().MakeArgString(llvm::Twine("-l") +
+            II.getInputArg().getValue()));
+        // CmdArgs.push_back(C.getArgs().MakeArgString(llvm::Twine("lib") +
+        //     II.getInputArg().getValue() + llvm::Twine(".a")));
         continue;
+      }
 
       StringRef OrigInputFileName =
           llvm::sys::path::filename(II.getBaseInput());
@@ -12424,7 +12632,8 @@ void NVPTX::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     AddOpenMPLinkerScript(getToolChain(), C, Output, Inputs, Args, CmdArgs, JA);
 
     const char *Exec =
-        Args.MakeArgString(getToolChain().GetProgramPath("nvlink"));
+        // Args.MakeArgString(getToolChain().GetProgramPath("nvlink"));
+        Args.MakeArgString(getToolChain().GetProgramPath("nvcc"));
     C.addCommand(llvm::make_unique<Command>(JA, *this, Exec, CmdArgs, Inputs));
     return;
   }
